@@ -2,6 +2,12 @@
 
 
 require 'fileutils'
+require 'Yk/debug2'
+
+if ARGV.size != 2
+	STDERR.write "USAGE: cp_noerror SRC_DIR DEST_DIR"
+	exit 1
+end
 
 
 SRC = ARGV[0]
@@ -11,40 +17,45 @@ DST = ARGV[1]
 MSG_D = "/tmp/cp_noerror"
 
 
-Dir.mkdir_p MSG_D
+FileUtils.mkdir_p MSG_D
 
 $ef = "#{MSG_D}/cp_noerror.#{$$}"
 
 newest = Time.at(0)
 newestF = nil
 
-Dir.glob MSG_D + "/cp_noerror.*.ok" do |e|
-	if File.mtime(e) > newest
-		newest = File.mtime(e)
-		newestF = e
-	end
-end
 
 OKList = {}
 
-if newestF
-	FileUtils.cp newestF, $ef + ".ok"
-end
-
-
-if File.exist? $ef + ".ok"
-	File.open $ef + ".ok" do |fr|
-		fr.read_line do |ln|
+Dir.glob MSG_D + "/cp_noerror.*.ok" do |e|
+	File.open e do |fr|
+		fr.each_line do |ln|
 			if ln =~ /^.*\|(.*):[^:]*$/
 				OKList[$1] = true
 			end
 		end
 	end
+#	if File.mtime(e) > newest
+#		newest = File.mtime(e)
+#		newestF = e
+#	end
 end
+
+
+#if File.exist? newestF
+#	File.open newestF do |fr|
+#		fr.each_line do |ln|
+#			if ln =~ /^.*\|(.*):[^:]*$/
+#				OKList[$1] = true
+#			end
+#		end
+#	end
+#end
 
 
 def out f, m, *fs
 	m = Time.now.to_s + "|" + f + ":" + m + ".\n"
+	msgpane
 	print m
 	["", *fs].each do |ext|
 		File.append $ef + ext, m
@@ -57,16 +68,20 @@ end
 
 def err f, m
 	out f, m, ".err"
+	print "\n\n\n\n\n\n\n\n\n\n"
+	print "\033[u"
 end
 
 def ok f
-	out f, "processed successfully", ".ok"
+	out f, "Processed successfully", ".ok"
 end
 
 
 class String
 	def / arg
 		if arg[0] == "/"
+			arg
+		elsif self.empty?
 			arg
 		elsif arg == "" || arg == nil
 			if self[-1] == "/"
@@ -78,7 +93,7 @@ class String
 			if self[-1] == "/"
 				self + arg
 			else
-				self.chop + "/" + arg
+				self + "/" + arg
 			end
 		end
 	end
@@ -93,12 +108,29 @@ class File
   end
 end
 
+def msgpane
+	print "\033[u"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[B\033[K"
+	print "\033[u"
+	STDOUT.flush
+end
+
 
 def each_dir dir = ""
 	if OKList[dir]
+		msg dir, "Already processed"
 		return
 	end
-	msg dir, "processing directory"
+	msg(dir == "" ? "." : dir, "processing directory")
 	s = SRC / dir
 	d = DST / dir
 	if File.symlink?(s) || !File.directory?(s)
@@ -113,18 +145,19 @@ def each_dir dir = ""
 		stat = File.stat(s)
 		FileUtils.chmod(stat.mode, d)
 		FileUtils.chown(stat.uid, stat.gid, d)
-		FileUtils.touch(d, mtime: stat.mtime, ctime: stat.ctime)
+		FileUtils.touch(d, mtime: stat.mtime)
 	rescue
 		err dir, "Failed to mkdir/copy attributes (#{$!}). Skipping"
 		return
 	end
 	begin
 		failed = false
-		Dir.each s do |f|
+		Dir.foreach s do |f|
 			sf = s / f
 			df = d / f
 			t = dir / f
 			if OKList[t]
+				msg t, "Already processed"
 				next
 			end
 			if f != "." && f != ".."
@@ -134,41 +167,47 @@ def each_dir dir = ""
 					else
 						msg t, "processing non-directory entry"
 						if File.symlink?(sf) || File.symlink?(df)
-							File.rm_f(df)
+							FileUtils.rm_f(df)
 						end
-						begin
-							if File.exist?(df) && File.cmp(sf , df)
-								msg t, "same file"
-								ok t
-							else
-								FileUtils.copy_entry sf , df, preserve: true
-								if File.cmp sf , df
-									msg t, "copied"
-									ok t
-								else
-									failed = true
-									err t, "miscopied"
+						if !File.symlink?(sf) && File.file?(sf)
+							begin
+								if File.symlink?(df) || !File.file?(df)
+									FileUtils.rm_f df
 								end
+								if !system "/usr/bin/rsync", "-avc", "--info=progress2", sf, df
+									err t, "Failed to rsync #{sf} #{df}. Skipping"
+								end
+							rescue => e
+								failed = true
+								err t, "Failed to copy entry (#{e}:#{e.backtrace[0]}). Skipping"
 							end
-						rescue
-							failed = true
-							err t, "Failed to copy entry (#{$!}). Skipping"
+						else
+							if !system "/bin/cp", "-af", sf, df
+								failed = true
+								err t, "Failed to copy entry ('/bin/cp -af #{sf} #{df}', failed). Skipping"
+							end
 						end
 					end
-				rescue
+				rescue => e
 					failed = true
-					err t, "Failed to stat entry (#{$!}). Skipping"
+					err t, "Failed to stat entry (#{e}:#{e.backtrace[0]}). Skipping"
 				end
 			end
 		end
-	rescue
-		err dir, "Failed to read directory entry (#{$!}). Skipping"
+	rescue => e
+		err dir, "Failed to read directory entry (#{e}:#{e.backtrace[0][0]}). Skipping"
 		return
 	end
 	if !failed
 		ok dir
 	end
 end
+
+print "\n\n\n\n\n\n\n\n\n\n"
+STDOUT.flush
+
+print "\033[10A\033[s"
+STDOUT.flush
 
 each_dir
 
