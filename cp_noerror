@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 
-#c
+$finished = false
 
 require 'fileutils'
 require 'Yk/debug2'
@@ -13,6 +13,8 @@ end
 
 SRC = ARGV[0]
 DST = ARGV[1]
+$cntP = 0.0
+$szP = 0.0
 
 
 MSG_D = "/tmp/cp_noerror"
@@ -55,7 +57,7 @@ end
 
 
 def out f, m, *fs
-	m = Time.now.to_s + "|" + f + ":" + m + ".\n"
+	m = "#{Time.now} #{$finished ? '' : '('}#{sprintf '%.1f', $cntP}%#{$finished ? '' : ')'}|#{f}:#{m}.\n"
 	msgpane
 	print m
 	["", *fs].each do |ext|
@@ -126,6 +128,26 @@ def msgpane
 end
 
 
+def psNodeNum pid
+	children = Hash.new do |h, k|
+		h[k] = Array.new
+	end
+	`ps ax -o 'pid ppid'`.each_line do |ln|
+		arr = ln.split
+		children[arr[1]].push arr[0]
+	end
+	getChildren = Proc.new do |c|
+		cls = children[c]
+		ret = cls.clone
+		cls.each do |d|
+			ret += getChildren[d]
+		end
+		ret
+	end
+	getChildren[pid].size
+end
+
+
 def each_dir dir = ""
 	if OKList[dir]
 		msg dir, "Already processed"
@@ -164,7 +186,9 @@ def each_dir dir = ""
 			if f != "." && f != ".."
 				begin
 					if !File.symlink?(sf) && File.directory?(sf)
-						each_dir t
+						incProcessed t do
+							each_dir t
+						end
 					else
 						msg t, "processing non-directory entry"
 						if File.symlink?(sf) || File.symlink?(df)
@@ -175,8 +199,58 @@ def each_dir dir = ""
 								if File.symlink?(df) || !File.file?(df)
 									FileUtils.rm_f df
 								end
-								if !system "/usr/bin/rsync", "-avc", "--info=progress2", sf, df
-									err t, "Failed to rsync #{sf} #{df}. Skipping"
+								sz = File.lstat(sf).size
+								if sz > 100000000
+									pid = fork do
+										exec "/usr/bin/rsync", "-avc", "--info=progress2", sf, df
+									end
+									Thread.abort_on_exception = true
+									Thread.new do
+										#begin
+											sleep 0.1
+											fd = nil
+											if File.exist? "/proc/#{pid}/fd"
+												Dir.foreach "/proc/#{pid}/fd" do |fent|
+													_s = "/proc/#{pid}/fd/#{fent}"
+													if File.symlink?(_s) && File.readlink(_s) == sf
+														fd = fent
+														break
+													end
+												end
+												if fd
+													sz = File.size sf
+													print "\n"
+													while psNodeNum(pid) <= 2
+														if File.exist? "/proc/#{pid}/fdinfo/#{fd}"
+															IO.read("/proc/#{pid}/fdinfo/#{fd}").each_line do |ln|
+																if ln =~ /^pos:\s*(\d+)/
+																	tmp = sprintf "%.1f", ($1.to_f / sz) * 100
+																	print "\033[0GScanning ... #{tmp} %\033[K"
+																	STDOUT.flush
+																end
+															end
+														else
+															break
+														end
+														sleep 1
+													end
+												end
+											end
+										#rescue
+										#end
+									end
+									t2 = Process.detach pid
+									if t2.value.to_i != 0
+										err t, "Failed to rsync #{sf} #{df}. Skipping"
+									else
+										ok t
+									end
+								else
+									if !system "/usr/bin/rsync", "-ac", sf, df
+										err t, "Failed to rsync #{sf} #{df}. Skipping"
+									else
+										ok t
+									end
 								end
 							rescue => e
 								failed = true
@@ -186,8 +260,11 @@ def each_dir dir = ""
 							if !system "/bin/cp", "-af", sf, df
 								failed = true
 								err t, "Failed to copy entry ('/bin/cp -af #{sf} #{df}', failed). Skipping"
+							else
+								ok t
 							end
 						end
+						incProcessed t
 					end
 				rescue => e
 					failed = true
@@ -196,7 +273,7 @@ def each_dir dir = ""
 			end
 		end
 	rescue => e
-		err dir, "Failed to read directory entry (#{e}:#{e.backtrace[0][0]}). Skipping"
+		err dir, "Failed to read directory entry (#{e}:#{e.backtrace[1]}). Skipping"
 		return
 	end
 	if !failed
@@ -204,11 +281,64 @@ def each_dir dir = ""
 	end
 end
 
-print "\n\n\n\n\n\n\n\n\n\n"
+print "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
 STDOUT.flush
 
-print "\033[10A\033[s"
+print "\033[15A\033[s"
 STDOUT.flush
 
-each_dir
+
+CntProgs = Hash.new do |h, k|
+	h[k] = 0
+end
+
+SzProgs = Hash.new do |h, k|
+	h[k] = 0
+end
+
+$all_cnt = 0
+$all_sz = 0
+
+def all_size dir = ""
+	s = SRC / dir
+	Dir.foreach s do |e|
+		if e == "." || e == ".."
+			next
+		end
+		f = s / e
+		if !File.symlink?(f) && File.directory?(f)
+			all_size dir / e
+		else
+			$all_cnt += 1
+			$all_sz += File.lstat(f).size
+			CntProgs[dir / e] = $all_cnt
+			SzProgs[dir / e] = $all_sz
+		end
+	end
+	$all_cnt += 1
+	$all_sz += File.lstat(s).size
+	CntProgs[dir] = $all_cnt
+	SzProgs[dir] = $all_sz
+end
+
+Thread.new do
+	all_size
+	$finished = true
+end
+
+
+def incProcessed t = ""
+	begin
+		if block_given?
+			yield
+		end
+	ensure
+		$cntP = (CntProgs[t].to_f / $all_cnt * 100) rescue 0.to_f
+		$szP = (SzProgs[t].to_f / $all_sz * 100) rescue 0.to_f
+	end
+end
+
+incProcessed do
+	each_dir
+end
 
