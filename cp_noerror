@@ -1,0 +1,174 @@
+#!/usr/bin/env ruby
+
+
+require 'fileutils'
+
+
+SRC = ARGV[0]
+DST = ARGV[1]
+
+
+MSG_D = "/tmp/cp_noerror"
+
+
+Dir.mkdir_p MSG_D
+
+$ef = "#{MSG_D}/cp_noerror.#{$$}"
+
+newest = Time.at(0)
+newestF = nil
+
+Dir.glob MSG_D + "/cp_noerror.*.ok" do |e|
+	if File.mtime(e) > newest
+		newest = File.mtime(e)
+		newestF = e
+	end
+end
+
+OKList = {}
+
+if newestF
+	FileUtils.cp newestF, $ef + ".ok"
+end
+
+
+if File.exist? $ef + ".ok"
+	File.open $ef + ".ok" do |fr|
+		fr.read_line do |ln|
+			if ln =~ /^.*\|(.*):[^:]*$/
+				OKList[$1] = true
+			end
+		end
+	end
+end
+
+
+def out f, m, *fs
+	m = Time.now.to_s + "|" + f + ":" + m + ".\n"
+	print m
+	["", *fs].each do |ext|
+		File.append $ef + ext, m
+	end
+end
+
+def msg f, m
+	out f, m
+end
+
+def err f, m
+	out f, m, ".err"
+end
+
+def ok f
+	out f, "processed successfully", ".ok"
+end
+
+
+class String
+	def / arg
+		if arg[0] == "/"
+			arg
+		elsif arg == "" || arg == nil
+			if self[-1] == "/"
+				self.chop
+			else
+				self
+			end
+		else
+			if self[-1] == "/"
+				self + arg
+			else
+				self.chop + "/" + arg
+			end
+		end
+	end
+end
+
+
+class File
+  class << self
+    def append(path, content)
+      File.open(path, "a") { |f| f << content }
+    end
+  end
+end
+
+
+def each_dir dir = ""
+	if OKList[dir]
+		return
+	end
+	msg dir, "processing directory"
+	s = SRC / dir
+	d = DST / dir
+	if File.symlink?(s) || !File.directory?(s)
+		STDERR.write "ERROR: The source path, '#{s}' is not a directory\n"
+		exit 1
+	end
+	begin
+		if File.symlink?(d) || (File.exist?(d) && !File.directory?(d))
+			FileUtils.rm_f d
+		end
+		FileUtils.mkdir_p d
+		stat = File.stat(s)
+		FileUtils.chmod(stat.mode, d)
+		FileUtils.chown(stat.uid, stat.gid, d)
+		FileUtils.touch(d, mtime: stat.mtime, ctime: stat.ctime)
+	rescue
+		err dir, "Failed to mkdir/copy attributes (#{$!}). Skipping"
+		return
+	end
+	begin
+		failed = false
+		Dir.each s do |f|
+			sf = s / f
+			df = d / f
+			t = dir / f
+			if OKList[t]
+				next
+			end
+			if f != "." && f != ".."
+				begin
+					if !File.symlink?(sf) && File.directory?(sf)
+						each_dir t
+					else
+						msg t, "processing non-directory entry"
+						if File.symlink?(sf) || File.symlink?(df)
+							File.rm_f(df)
+						end
+						begin
+							if File.exist?(df) && File.cmp(sf , df)
+								msg t, "same file"
+								ok t
+							else
+								FileUtils.copy_entry sf , df, preserve: true
+								if File.cmp sf , df
+									msg t, "copied"
+									ok t
+								else
+									failed = true
+									err t, "miscopied"
+								end
+							end
+						rescue
+							failed = true
+							err t, "Failed to copy entry (#{$!}). Skipping"
+						end
+					end
+				rescue
+					failed = true
+					err t, "Failed to stat entry (#{$!}). Skipping"
+				end
+			end
+		end
+	rescue
+		err dir, "Failed to read directory entry (#{$!}). Skipping"
+		return
+	end
+	if !failed
+		ok dir
+	end
+end
+
+each_dir
+
