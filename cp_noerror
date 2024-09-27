@@ -23,10 +23,16 @@ MSG_D = "/tmp/cp_noerror"
 FileUtils.mkdir_p MSG_D
 
 $ef = "#{MSG_D}/cp_noerror.#{$$}"
+["#{MSG_D}/cp_noerror", "#{MSG_D}/cp_noerror.ok", "#{MSG_D}/cp_noerror.err"].each do |e|
+	FileUtils.rm_f e
+end
+
+File.symlink "#{MSG_D}/cp_noerror.#{$$}", "#{MSG_D}/cp_noerror"
+File.symlink "#{MSG_D}/cp_noerror.#{$$}.ok", "#{MSG_D}/cp_noerror.ok"
+File.symlink "#{MSG_D}/cp_noerror.#{$$}.err", "#{MSG_D}/cp_noerror.err"
 
 newest = Time.at(0)
 newestF = nil
-
 
 OKList = {}
 
@@ -57,7 +63,11 @@ end
 
 
 def out f, m, *fs
-	m = "#{Time.now} #{$finished ? '' : '('}#{sprintf '%.1f', $cntP}%#{$finished ? '' : ')'}|#{f}:#{m}.\n"
+	prg = "#{$finished ? '' : '('}"
+	prg += "#{CntProgs[f]}/#{$all_cnt} #{sprintf '%.3f', CntProgs[f].to_f / $all_cnt * 100}"
+	prg += " #{SzProgs[f]}/#{$all_sz} #{sprintf '%.3f', SzProgs[f].to_f / $all_sz * 100}"
+	prg += "#{$finished ? '' : ')'}"
+	m = "#{Time.now} #{prg}|#{f}:#{m.capitalize}.\n"
 	msgpane
 	print m
 	["", *fs].each do |ext|
@@ -240,13 +250,16 @@ def each_dir dir = ""
 										#end
 									end
 									t2 = Process.detach pid
+									Process.waitpid pid
 									if t2.value.to_i != 0
+										failed = true
 										err t, "Failed to rsync #{sf} #{df}. Skipping"
 									else
 										ok t
 									end
 								else
 									if !system "/usr/bin/rsync", "-ac", sf, df
+										failed = true
 										err t, "Failed to rsync #{sf} #{df}. Skipping"
 									else
 										ok t
@@ -254,7 +267,7 @@ def each_dir dir = ""
 								end
 							rescue => e
 								failed = true
-								err t, "Failed to copy entry (#{e}:#{e.backtrace[0]}). Skipping"
+								err t, "Failed to copy entry (#{e.class}: #{e} at #{e.backtrace[0]}). Skipping"
 							end
 						else
 							if !system "/bin/cp", "-af", sf, df
@@ -268,7 +281,7 @@ def each_dir dir = ""
 					end
 				rescue => e
 					failed = true
-					err t, "Failed to stat entry (#{e}:#{e.backtrace[0]}). Skipping"
+					err t, "Failed to stat entry (#{e.class}: #{e} at #{e.backtrace[0]}). Skipping"
 				end
 			end
 		end
@@ -300,29 +313,38 @@ $all_cnt = 0
 $all_sz = 0
 
 def all_size dir = ""
-	s = SRC / dir
-	Dir.foreach s do |e|
-		if e == "." || e == ".."
-			next
+	begin
+		s = SRC / dir
+		Dir.foreach s do |e|
+			if e == "." || e == ".."
+				next
+			end
+			f = s / e
+			if !File.symlink?(f) && File.directory?(f)
+				all_size dir / e
+			else
+				begin
+					$all_cnt += 1
+					$all_sz += File.lstat(f).size
+					CntProgs[dir / e] = $all_cnt
+					SzProgs[dir / e] = $all_sz
+				rescue => e
+					err "def all_size", "Exception from def all_size / #{e.class}: #{e} at #{e.backtrace[0]}"
+				end
+			end
 		end
-		f = s / e
-		if !File.symlink?(f) && File.directory?(f)
-			all_size dir / e
-		else
-			$all_cnt += 1
-			$all_sz += File.lstat(f).size
-			CntProgs[dir / e] = $all_cnt
-			SzProgs[dir / e] = $all_sz
-		end
+		$all_cnt += 1
+		$all_sz += File.lstat(s).size
+		CntProgs[dir] = $all_cnt
+		SzProgs[dir] = $all_sz
+	rescue => e
+		err "def all_size", "Exception from def all_size / #{e.class}: #{e} at #{e.backtrace[0]}"
 	end
-	$all_cnt += 1
-	$all_sz += File.lstat(s).size
-	CntProgs[dir] = $all_cnt
-	SzProgs[dir] = $all_sz
 end
 
 Thread.new do
 	all_size
+	msg "all_size", "Finished"
 	$finished = true
 end
 
